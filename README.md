@@ -829,6 +829,8 @@ chmv2_model = torch.hub.load(
 
 Refer to this [notebook](notebooks/chmv2_inference.ipynb) for an example of how to use the DINOv3 + CHMv2 model.
 
+This [notebook](notebooks/chmv2_dataset_exploration.ipynb) can be used to download inference data from the existing global dataset stored on aws.
+
 ## License
 
 DINOv3 code and model weights are released under the DINOv3 License. See [LICENSE.md](LICENSE.md) for additional details.
