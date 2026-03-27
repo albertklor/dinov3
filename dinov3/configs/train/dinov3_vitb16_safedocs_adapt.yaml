@@ -1,0 +1,33 @@
+train:
+  dataset_path: SafeDocs:split=TRAIN:root=albertklorer/safedocs
+  output_dir: ./outputs/dinov3_vitb16_safedocs_adapt
+  batch_size_per_gpu: 16
+  cache_dataset: false
+
+student:
+  arch: vit_base
+  patch_size: 16
+  resume_from_teacher_chkpt: ""
+  layerscale: 1.0
+  norm_layer: layernormbf16
+  n_storage_tokens: 4
+  mask_k_bias: true
+  pos_embed_rope_rescale_coords: 2.0
+
+crops:
+  global_crops_size: 448
+  local_crops_size: 192
+  horizontal_flips: false
+  use_color_jitter: false
+  use_solarize: false
+
+hf_hub:
+  token_env: HF_TOKEN
+  init_model_id: facebook/dinov3-vitb16-pretrain-lvd1689m
+  init_revision: main
+  push_checkpoints: true
+  repo_id: ""
+  repo_id_env: HF_REPO_ID
+  push_path_prefix: dinov3_vitb16_safedocs_adapt
+  create_repo: true
+  private_repo: false

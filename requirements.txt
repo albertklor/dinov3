@@ -1,6 +1,9 @@
+datasets
 ftfy
+huggingface_hub
 omegaconf
 regex
+safetensors
 scikit-learn
 submitit
 termcolor

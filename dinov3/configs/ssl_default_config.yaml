@@ -160,6 +160,8 @@ crops:
   localcrops_subset_of_globalcrops: false
   share_color_jitter: false
   horizontal_flips: true
+  use_color_jitter: true
+  use_solarize: true
   gram_teacher_no_distortions: false  # If True, no distortions are applied to gram teacher crops
   rgb_mean:
   - 0.485
@@ -180,6 +182,16 @@ checkpointing:
   period: 3750
   max_to_keep: 3
   keep_every: 99999999999999999  # Save a checkpoint every N iterations, regardless of max_to_keep and period
+hf_hub:
+  token_env: HF_TOKEN
+  repo_id: ""
+  repo_id_env: HF_REPO_ID
+  create_repo: true
+  private_repo: false
+  init_model_id: ""
+  init_revision: main
+  push_checkpoints: false
+  push_path_prefix: checkpoints
 
 # Example of constant schedules with schedules v2
 # # schedules:

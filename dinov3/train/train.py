@@ -20,6 +20,9 @@ from torch.distributed._tensor import DTensor
 import dinov3.distributed as distributed
 from dinov3.checkpointer import (
     find_latest_checkpoint,
+    resolve_hf_hub_repo_id,
+    resolve_hf_hub_token,
+    upload_checkpoint_to_hf_hub,
     keep_checkpoint_copy,
     keep_last_n_checkpoints,
     load_checkpoint,
@@ -252,17 +255,41 @@ def do_test(cfg, model, iteration, process_group, do_low_freq=False):
         )
         if not distributed.is_subgroup_main_process():
             return
-    else:
-        new_state_dict = model.model_ema.state_dict()
-        for k, tensor in list(new_state_dict.items()):
-            if isinstance(tensor, DTensor):
-                new_state_dict[k] = tensor.full_tensor()
-        if not distributed.is_subgroup_main_process():
-            return
-        # save teacher checkpoint
-        ckpt_path = eval_dir / "teacher_checkpoint.pth"
-        torch.save({"teacher": new_state_dict}, ckpt_path)
-        logger.info("Saved eval checkpoint: %s", ckpt_path)
+    if not distributed.is_subgroup_main_process():
+        return
+    ckpt_path = save_consolidated_teacher_checkpoint(model, eval_dir / "teacher_checkpoint.pth")
+    maybe_push_checkpoint_to_hf_hub(
+        cfg,
+        ckpt_path,
+        path_in_repo=Path(cfg.hf_hub.push_path_prefix) / "eval" / str(iteration) / ckpt_path.name,
+        commit_message=f"Upload eval teacher checkpoint {iteration}",
+    )
+
+
+def save_consolidated_teacher_checkpoint(model, ckpt_path: Path) -> Path:
+    new_state_dict = model.model_ema.state_dict()
+    for k, tensor in list(new_state_dict.items()):
+        if isinstance(tensor, DTensor):
+            new_state_dict[k] = tensor.full_tensor()
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"teacher": new_state_dict}, ckpt_path)
+    logger.info("Saved teacher checkpoint: %s", ckpt_path)
+    return ckpt_path
+
+
+def maybe_push_checkpoint_to_hf_hub(cfg, local_path: Path, *, path_in_repo: Path, commit_message: str):
+    if not cfg.hf_hub.push_checkpoints:
+        return
+    upload_checkpoint_to_hf_hub(
+        local_path=local_path,
+        repo_id=cfg.hf_hub.repo_id,
+        repo_id_env=cfg.hf_hub.repo_id_env,
+        path_in_repo=path_in_repo.as_posix(),
+        token_env=cfg.hf_hub.token_env,
+        create_repo=cfg.hf_hub.create_repo,
+        private_repo=cfg.hf_hub.private_repo,
+        commit_message=commit_message,
+    )
 
 
 def build_data_loader_from_cfg(
@@ -561,8 +588,9 @@ def do_train(cfg, model, resume=False):
         # Checkpointing
         if (iteration + 1) % cfg.checkpointing.period == 0:
             torch.cuda.synchronize()
+            periodic_ckpt_dir = ckpt_dir / str(iteration)
             save_checkpoint(
-                ckpt_dir / str(iteration),
+                periodic_ckpt_dir,
                 iteration=iteration,
                 model=model,
                 optimizer=optimizer,
@@ -570,6 +598,19 @@ def do_train(cfg, model, resume=False):
                 process_group=process_subgroup,
             )
             if distributed.is_subgroup_main_process():
+                teacher_ckpt_path = save_consolidated_teacher_checkpoint(
+                    model,
+                    periodic_ckpt_dir / "teacher_checkpoint.pth",
+                )
+                maybe_push_checkpoint_to_hf_hub(
+                    cfg,
+                    teacher_ckpt_path,
+                    path_in_repo=Path(cfg.hf_hub.push_path_prefix)
+                    / "ckpt"
+                    / str(iteration)
+                    / teacher_ckpt_path.name,
+                    commit_message=f"Upload teacher checkpoint {iteration}",
+                )
                 keep_last_n_checkpoints(ckpt_dir, cfg.checkpointing.max_to_keep)
                 if "keep_every" in cfg.checkpointing and (iteration + 1) % cfg.checkpointing.keep_every == 0:
                     keep_checkpoint_copy(ckpt_dir / str(iteration))
@@ -596,6 +637,10 @@ def main(argv=None):
         setup_job(output_dir=args.output_dir, seed=args.seed)
         cfg = setup_config(args, strict_cfg=False)
         logger.info(cfg)
+        if cfg.hf_hub.init_model_id or cfg.hf_hub.push_checkpoints:
+            resolve_hf_hub_token(cfg.hf_hub.token_env)
+        if cfg.hf_hub.push_checkpoints:
+            resolve_hf_hub_repo_id(cfg.hf_hub.repo_id, cfg.hf_hub.repo_id_env)
         setup_logging(
             output=os.path.join(os.path.abspath(args.output_dir), "nan_logs"),
             name="nan_logger",

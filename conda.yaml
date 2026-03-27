@@ -7,11 +7,14 @@ dependencies:
   - omegaconf
   - pip
   - pip:
+    - datasets
     - ftfy # needed for dino.txt
+    - huggingface_hub
     - iopath
     - omegaconf
     - pandas 
     - regex # needed for dino.txt
+    - safetensors
     - pandas
     - scikit-learn
     - scikit-learn-intelex

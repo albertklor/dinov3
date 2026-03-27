@@ -30,6 +30,8 @@ class DataAugmentationDINO(object):
         patch_size=16,
         share_color_jitter=False,
         horizontal_flips=True,
+        use_color_jitter=True,
+        use_solarize=True,
         mean=IMAGENET_DEFAULT_MEAN,
         std=IMAGENET_DEFAULT_STD,
     ):
@@ -44,6 +46,8 @@ class DataAugmentationDINO(object):
         self.local_crops_subset_of_global_crops = local_crops_subset_of_global_crops
         self.patch_size = patch_size
         self.share_color_jitter = share_color_jitter
+        self.use_color_jitter = use_color_jitter
+        self.use_solarize = use_solarize
         self.mean = mean
         self.std = std
 
@@ -61,6 +65,8 @@ class DataAugmentationDINO(object):
         logger.info(f"patch_size if local_crops_subset_of_global_crops: {patch_size}")
         logger.info(f"share_color_jitter: {share_color_jitter}")
         logger.info(f"horizontal flips: {horizontal_flips}")
+        logger.info(f"use color jitter: {use_color_jitter}")
+        logger.info(f"use solarize: {use_solarize}")
         logger.info("###################################")
 
         # Global crops and gram teacher crops can have different sizes. We first take a crop of the maximum size
@@ -119,24 +125,25 @@ class DataAugmentationDINO(object):
         )
 
         # color distortions / blurring
-        color_jittering = v2.Compose(
-            [
-                v2.RandomApply(
-                    [v2.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
-                    p=0.8,
-                ),
-                v2.RandomGrayscale(p=0.2),
-            ]
-        )
+        if use_color_jitter:
+            color_jittering = v2.Compose(
+                [
+                    v2.RandomApply(
+                        [v2.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
+                        p=0.8,
+                    ),
+                    v2.RandomGrayscale(p=0.2),
+                ]
+            )
+        else:
+            color_jittering = nn.Identity()
 
         global_transfo1_extra = GaussianBlur(p=1.0)
 
-        global_transfo2_extra = v2.Compose(
-            [
-                GaussianBlur(p=0.1),
-                v2.RandomSolarize(threshold=128, p=0.2),
-            ]
-        )
+        global_transfo2_extra_ops = [GaussianBlur(p=0.1)]
+        if use_solarize:
+            global_transfo2_extra_ops.append(v2.RandomSolarize(threshold=128, p=0.2))
+        global_transfo2_extra = v2.Compose(global_transfo2_extra_ops)
 
         local_transfo_extra = GaussianBlur(p=0.5)
 

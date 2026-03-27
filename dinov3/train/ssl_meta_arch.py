@@ -12,7 +12,7 @@ from omegaconf import OmegaConf
 from torch import Tensor, nn
 
 import dinov3.distributed as distributed
-from dinov3.checkpointer import init_fsdp_model_from_checkpoint
+from dinov3.checkpointer import init_fsdp_backbone_from_hf_hub, init_fsdp_model_from_checkpoint
 from dinov3.configs import get_default_config
 from dinov3.data import DataAugmentationDINO
 from dinov3.fsdp.ac_compile_parallelize import ac_compile_parallelize
@@ -325,6 +325,20 @@ class SSLMetaArch(nn.Module):
                 raise ValueError(f"Provide a correct path to {self.gram_ckpt}")
             self.gram_teacher.requires_grad_(False)
             self.gram_teacher.eval()
+        if self.cfg.hf_hub.init_model_id:
+            if self.cfg.student.resume_from_teacher_chkpt:
+                raise ValueError(
+                    "Use either `hf_hub.init_model_id` or `student.resume_from_teacher_chkpt`, not both."
+                )
+            logger.info(f"Loading backbone weights from Hugging Face: {self.cfg.hf_hub.init_model_id}")
+            init_fsdp_backbone_from_hf_hub(
+                self.student.backbone,
+                repo_id=self.cfg.hf_hub.init_model_id,
+                revision=self.cfg.hf_hub.init_revision,
+                token_env=self.cfg.hf_hub.token_env,
+                process_group=distributed.get_process_subgroup(),
+            )
+            self.model_ema.load_state_dict(self.student.state_dict())
         if self.cfg.student.resume_from_teacher_chkpt:
             logger.info(f"Loading pretrained weights from {self.cfg.student.resume_from_teacher_chkpt}")
             init_fsdp_model_from_checkpoint(
@@ -756,6 +770,8 @@ class SSLMetaArch(nn.Module):
             local_crops_subset_of_global_crops=cfg.crops.localcrops_subset_of_globalcrops,
             share_color_jitter=cfg.crops.share_color_jitter,
             horizontal_flips=cfg.crops.horizontal_flips,
+            use_color_jitter=cfg.crops.use_color_jitter,
+            use_solarize=cfg.crops.use_solarize,
             mean=cfg.crops.rgb_mean,
             std=cfg.crops.rgb_std,
         )

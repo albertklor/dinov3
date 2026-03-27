@@ -25,6 +25,8 @@ Distributed checkpointer docs:
 """
 
 import logging
+import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -37,6 +39,9 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.distributed.checkpoint.filesystem as dcpfs
 import torch.distributed.checkpoint.state_dict as dcpsd
+from huggingface_hub import HfApi, hf_hub_download
+from safetensors import safe_open
+from torch.distributed._tensor import DTensor
 from torch.distributed.checkpoint.stateful import Stateful
 
 logger = logging.getLogger("dinov3")
@@ -302,6 +307,178 @@ def init_fsdp_model_from_checkpoint(
         )
     else:  # DCP checkpoint
         load_checkpoint(ckpt_dir=checkpoint_path, model=model, process_group=process_group)
+
+
+def resolve_hf_hub_token(token_env: str | None) -> str:
+    env_names = []
+    if token_env:
+        env_names.append(token_env)
+    for fallback in ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
+        if fallback not in env_names:
+            env_names.append(fallback)
+
+    for env_name in env_names:
+        token = os.environ.get(env_name)
+        if token:
+            return token
+    raise RuntimeError(
+        "No Hugging Face token found. Set one of these environment variables: "
+        + ", ".join(env_names)
+    )
+
+
+def resolve_hf_hub_repo_id(repo_id: str | None, repo_id_env: str | None = None) -> str:
+    if repo_id:
+        return repo_id
+    if repo_id_env:
+        env_repo_id = os.environ.get(repo_id_env)
+        if env_repo_id:
+            return env_repo_id
+    raise RuntimeError("No Hugging Face repo id configured. Set `hf_hub.repo_id` or the configured repo-id env var.")
+
+
+def _get_world_mesh(process_group: dist.ProcessGroup | None):
+    from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+
+    if process_group is None:
+        return init_device_mesh(
+            "cuda",
+            mesh_shape=(dist.get_world_size(),),
+            mesh_dim_names=("dp",),
+        )
+    return DeviceMesh.from_group(process_group, "cuda")
+
+
+def _convert_hf_dinov3_vit_backbone_state_dict(
+    *,
+    model_state_dict: dict[str, torch.Tensor],
+    repo_id: str,
+    revision: str,
+    token: str,
+) -> dict[str, torch.Tensor]:
+    config_path = hf_hub_download(repo_id=repo_id, filename="config.json", revision=revision, token=token)
+    weights_path = hf_hub_download(repo_id=repo_id, filename="model.safetensors", revision=revision, token=token)
+
+    with open(config_path) as f:
+        hf_config = json.load(f)
+
+    converted: dict[str, torch.Tensor] = {}
+    with safe_open(weights_path, framework="pt") as f:
+        converted["cls_token"] = f.get_tensor("embeddings.cls_token")
+        converted["mask_token"] = f.get_tensor("embeddings.mask_token").squeeze(0)
+        converted["patch_embed.proj.weight"] = f.get_tensor("embeddings.patch_embeddings.weight")
+        converted["patch_embed.proj.bias"] = f.get_tensor("embeddings.patch_embeddings.bias")
+
+        if "embeddings.register_tokens" in f.keys():
+            converted["storage_tokens"] = f.get_tensor("embeddings.register_tokens")
+
+        num_hidden_layers = int(hf_config["num_hidden_layers"])
+        for i in range(num_hidden_layers):
+            hf_prefix = f"layer.{i}"
+            local_prefix = f"blocks.{i}"
+
+            q_weight = f.get_tensor(f"{hf_prefix}.attention.q_proj.weight")
+            k_weight = f.get_tensor(f"{hf_prefix}.attention.k_proj.weight")
+            v_weight = f.get_tensor(f"{hf_prefix}.attention.v_proj.weight")
+            converted[f"{local_prefix}.attn.qkv.weight"] = torch.cat((q_weight, k_weight, v_weight), dim=0)
+
+            q_bias = f.get_tensor(f"{hf_prefix}.attention.q_proj.bias")
+            v_bias = f.get_tensor(f"{hf_prefix}.attention.v_proj.bias")
+            k_bias = torch.zeros_like(q_bias)
+            converted[f"{local_prefix}.attn.qkv.bias"] = torch.cat((q_bias, k_bias, v_bias), dim=0)
+
+            converted[f"{local_prefix}.attn.proj.weight"] = f.get_tensor(f"{hf_prefix}.attention.o_proj.weight")
+            converted[f"{local_prefix}.attn.proj.bias"] = f.get_tensor(f"{hf_prefix}.attention.o_proj.bias")
+            converted[f"{local_prefix}.ls1.gamma"] = f.get_tensor(f"{hf_prefix}.layer_scale1.lambda1")
+            converted[f"{local_prefix}.ls2.gamma"] = f.get_tensor(f"{hf_prefix}.layer_scale2.lambda1")
+            converted[f"{local_prefix}.norm1.weight"] = f.get_tensor(f"{hf_prefix}.norm1.weight")
+            converted[f"{local_prefix}.norm1.bias"] = f.get_tensor(f"{hf_prefix}.norm1.bias")
+            converted[f"{local_prefix}.norm2.weight"] = f.get_tensor(f"{hf_prefix}.norm2.weight")
+            converted[f"{local_prefix}.norm2.bias"] = f.get_tensor(f"{hf_prefix}.norm2.bias")
+            converted[f"{local_prefix}.mlp.fc1.weight"] = f.get_tensor(f"{hf_prefix}.mlp.up_proj.weight")
+            converted[f"{local_prefix}.mlp.fc1.bias"] = f.get_tensor(f"{hf_prefix}.mlp.up_proj.bias")
+            converted[f"{local_prefix}.mlp.fc2.weight"] = f.get_tensor(f"{hf_prefix}.mlp.down_proj.weight")
+            converted[f"{local_prefix}.mlp.fc2.bias"] = f.get_tensor(f"{hf_prefix}.mlp.down_proj.bias")
+
+        converted["norm.weight"] = f.get_tensor("norm.weight")
+        converted["norm.bias"] = f.get_tensor("norm.bias")
+
+    for key, tensor in converted.items():
+        if key not in model_state_dict:
+            raise RuntimeError(
+                f"HF weight {key} does not exist in the local backbone. "
+                "Check that the local config matches the HF model architecture."
+            )
+        if tuple(model_state_dict[key].shape) != tuple(tensor.shape):
+            raise RuntimeError(
+                f"Shape mismatch for {key}: local {tuple(model_state_dict[key].shape)} vs HF {tuple(tensor.shape)}. "
+                "Check `student.arch`, `student.n_storage_tokens`, and RoPE/register-token settings."
+            )
+    return converted
+
+
+def init_fsdp_backbone_from_hf_hub(
+    model: torch.nn.Module,
+    *,
+    repo_id: str,
+    revision: str = "main",
+    token_env: str | None = "HF_TOKEN",
+    process_group: dist.ProcessGroup = None,
+):
+    token = resolve_hf_hub_token(token_env)
+    state_dict = dcpsd.get_model_state_dict(model)
+    converted = _convert_hf_dinov3_vit_backbone_state_dict(
+        model_state_dict=state_dict,
+        repo_id=repo_id,
+        revision=revision,
+        token=token,
+    )
+    world_mesh = _get_world_mesh(process_group)
+    for key, tensor in converted.items():
+        if isinstance(state_dict[key], DTensor):
+            state_dict[key] = torch.distributed.tensor.distribute_tensor(tensor, world_mesh, src_data_rank=None)
+        else:
+            state_dict[key] = tensor
+    dcpsd.set_model_state_dict(model, state_dict)
+    logger.info("Loaded Hugging Face pretrained backbone from %s@%s", repo_id, revision)
+
+
+def upload_checkpoint_to_hf_hub(
+    local_path: str | Path,
+    *,
+    repo_id: str | None,
+    repo_id_env: str | None = None,
+    path_in_repo: str,
+    token_env: str | None = "HF_TOKEN",
+    create_repo: bool = True,
+    private_repo: bool = False,
+    commit_message: str | None = None,
+):
+    token = resolve_hf_hub_token(token_env)
+    resolved_repo_id = resolve_hf_hub_repo_id(repo_id, repo_id_env)
+    local_path = Path(local_path)
+    api = HfApi(token=token)
+    if create_repo:
+        api.create_repo(repo_id=resolved_repo_id, repo_type="model", private=private_repo, exist_ok=True)
+
+    commit_message = commit_message or f"Upload {local_path.name}"
+    if local_path.is_dir():
+        api.upload_folder(
+            repo_id=resolved_repo_id,
+            repo_type="model",
+            folder_path=str(local_path),
+            path_in_repo=path_in_repo,
+            commit_message=commit_message,
+        )
+    else:
+        api.upload_file(
+            repo_id=resolved_repo_id,
+            repo_type="model",
+            path_or_fileobj=str(local_path),
+            path_in_repo=path_in_repo,
+            commit_message=commit_message,
+        )
+    logger.info("Uploaded %s to hf://%s/%s", local_path, resolved_repo_id, path_in_repo)
 
 
 # Initialize a standard non distributed PyTorch model from PyTorch standard checkpoint for evals
